@@ -41,6 +41,8 @@
 /*  5. Absolutely no warranty is expressed or implied.                   */
 /*-----------------------------------------------------------------------*/
 # include <stdio.h>
+# include <stdlib.h>
+# include <time.h>
 # include <unistd.h>
 # include <math.h>
 # include <float.h>
@@ -176,22 +178,30 @@
 #define STREAM_TYPE double
 #endif
 
+#define NKERNELS 6
+
 static STREAM_TYPE	a[STREAM_ARRAY_SIZE+OFFSET],
 			b[STREAM_ARRAY_SIZE+OFFSET],
-			c[STREAM_ARRAY_SIZE+OFFSET];
+                        c[STREAM_ARRAY_SIZE+OFFSET],
+                        d[STREAM_ARRAY_SIZE+OFFSET],
+                        e[STREAM_ARRAY_SIZE+OFFSET],
+                        f[STREAM_ARRAY_SIZE+OFFSET];
 
-static double	avgtime[4] = {0}, maxtime[4] = {0},
-		mintime[4] = {FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX};
+static double	avgtime[NKERNELS] = {0}, maxtime[NKERNELS] = {0},
+                mintime[NKERNELS] = {FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX};
 
-static char	*label[4] = {"Copy:      ", "Scale:     ",
-    "Add:       ", "Triad:     "};
+static char	*label[NKERNELS] = {"Copy:      ", "Scale:     ",
+                                    "Add:       ", "Triad:     ",
+                                    "Upwind-if: ", "Upwind-abs:"};
 
-static double	bytes[4] =
+static double	bytes[NKERNELS] =
 {
   2 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
   2 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
   3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
-  3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE
+  3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
+  4 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
+  4 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE
 };
 
 extern double mysecond();
@@ -212,8 +222,8 @@ main()
   int			BytesPerWord;
   int			k;
   ssize_t		j;
-  STREAM_TYPE		scalar;
-  double		t, times[4][NTIMES];
+  STREAM_TYPE		scalar, dmag;
+  double		t, times[NKERNELS][NTIMES];
 
   /* --- SETUP --- determine precision and check timing --- */
 
@@ -307,7 +317,10 @@ main()
   printf("For best results, please be sure you know the\n");
   printf("precision of your system timer.\n");
   printf(HLINE);
-    
+
+  /* -- Initialise RNG -- */
+  srand(time(NULL));
+  
   /*	--- MAIN LOOP --- repeat test cases NTIMES times --- */
 
   scalar = 3.0;
@@ -360,13 +373,58 @@ main()
     }
 #endif
     times[3][k] = mysecond() - times[3][k];
+
+    /* -- Upwind kernels -- */
+
+#pragma omp parallel for
+    // Set random "velocity" field
+    for (j = 0; j < STREAM_ARRAY_SIZE; j++)
+    {
+      d[j] = 2.0 * rand() - 1.0;
+    }
+    
+    // Reference "upwind" kernel
+    times[4][k] = mysecond();
+#ifdef TUNED
+    printf("WARN: TUNED upwind not implemented\n");
+#else
+#pragma omp parallel for
+    for (j = 0; j < STREAM_ARRAY_SIZE; j++)
+    {
+      if (d[j] > 0.0)
+      {
+	// Pick the "left" (a) value
+	e[j] = a[j] * d[j];
+      }
+      else
+      {
+	// Pick the "right" (b) value
+	e[j] = -b[j] * d[j];
+      }
+    }
+#endif
+    times[4][k] = mysecond() - times[4][k];
+
+    // Absolute-based "upwind" kernel
+    times[5][k] = mysecond();
+#ifdef TUNED
+    printf("WARN: TUNED upwind not implemented\n");
+#else
+#pragma omp parallel for
+    for (j = 0; j < STREAM_ARRAY_SIZE; j++)
+    {
+      dmag = fabs(d[j]);
+      f[j] = 0.5 * (a[j] * (d[j] + dmag) + b[j] * (d[j] - dmag));
+    }
+#endif
+    times[5][k] = mysecond() - times[5][k];
   }
 
   /*	--- SUMMARY --- */
 
   for (k=1; k<NTIMES; k++) /* note -- skip first iteration */
   {
-    for (j=0; j<4; j++)
+    for (j=0; j<NKERNELS; j++)
     {
       avgtime[j] = avgtime[j] + times[j][k];
       mintime[j] = MIN(mintime[j], times[j][k]);
@@ -375,7 +433,7 @@ main()
   }
     
   printf("Function    Best Rate MB/s  Avg time     Min time     Max time\n");
-  for (j=0; j<4; j++)
+  for (j=0; j<NKERNELS; j++)
   {
     avgtime[j] = avgtime[j]/(double)(NTIMES-1);
 
@@ -453,8 +511,8 @@ double mysecond()
 void checkSTREAMresults ()
 {
   STREAM_TYPE aj,bj,cj,scalar;
-  STREAM_TYPE aSumErr,bSumErr,cSumErr;
-  STREAM_TYPE aAvgErr,bAvgErr,cAvgErr;
+  STREAM_TYPE aSumErr,bSumErr,cSumErr,uwSumErr;
+  STREAM_TYPE aAvgErr,bAvgErr,cAvgErr,uwAvgErr;
   double epsilon;
   ssize_t	j;
   int	k,ierr,err;
@@ -479,16 +537,19 @@ void checkSTREAMresults ()
   aSumErr = 0.0;
   bSumErr = 0.0;
   cSumErr = 0.0;
+  uwSumErr = 0.0;
   for (j=0; j<STREAM_ARRAY_SIZE; j++)
   {
     aSumErr += abs(a[j] - aj);
     bSumErr += abs(b[j] - bj);
     cSumErr += abs(c[j] - cj);
+    uwSumErr += abs(f[j] - e[j]);
     // if (j == 417) printf("Index 417: c[j]: %f, cj: %f\n",c[j],cj);	// MCCALPIN
   }
   aAvgErr = aSumErr / (STREAM_TYPE) STREAM_ARRAY_SIZE;
   bAvgErr = bSumErr / (STREAM_TYPE) STREAM_ARRAY_SIZE;
   cAvgErr = cSumErr / (STREAM_TYPE) STREAM_ARRAY_SIZE;
+  uwAvgErr = uwSumErr / (STREAM_TYPE) STREAM_ARRAY_SIZE;
 
   if (sizeof(STREAM_TYPE) == 4)
   {
@@ -573,6 +634,27 @@ void checkSTREAMresults ()
       }
     }
     printf("     For array c[], %d errors were found.\n",ierr);
+  }
+  if (abs(uwAvgErr) > epsilon * e[0])
+  {
+    err++;
+    printf("Failed Validation on upwind\n");
+    printf("%e\n", uwAvgErr);
+    ierr = 0;
+    for (j = 0; j < STREAM_ARRAY_SIZE; j++)
+    {
+      if (abs(f[j] - e[j]) > epsilon * e[j])
+      {
+	ierr++;
+#ifdef VERBOSE
+	if (ierr < 10)
+	{
+	  printf("         array f: index: %ld, expected: %e, observed: %e, relative error: %e\n",
+		 j,e[j],f[j],abs((e[j]-f[j])/uwAvgErr));
+	}
+#endif
+      }
+    }
   }
   if (err == 0)
   {
